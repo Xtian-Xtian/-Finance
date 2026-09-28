@@ -1,0 +1,210 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Outfit', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+  /* Flat, near-black surfaces with hairline borders. */
+  --color-canvas: #050507;
+  --color-surface: #0c0c10;
+  --color-surface-2: #131319;
+  --color-surface-3: #1b1b23;
+  --color-line: #1e1e27;
+  --color-line-strong: #2b2b36;
+  --color-ink: #f4f4f5;
+  --color-ink-muted: #a1a1aa;
+  --color-ink-faint: #6b6b76;
+
+  /* Lime accent with violet + mint supporting colours. */
+  --color-accent: #c8f542;
+  --color-accent-strong: #b2df2c;
+  --color-accent-soft: #c8f5421f;
+  --color-violet: #7c6cf6;
+  --color-mint: #5eead4;
+  --color-amber: #f5b041;
+  --color-positive: #4ade80;
+  --color-negative: #f87171;
+  --color-warning: #facc15;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+/* Light theme: same token names, light values. Toggled via <html data-theme="light">
+   (ThemeProvider / public/theme-init.js). Dark is the default. */
+:root[data-theme='light'] {
+  --color-canvas: #f4f5f7;
+  --color-surface: #ffffff;
+  --color-surface-2: #f3f4f7;
+  --color-surface-3: #e8eaef;
+  --color-line: #e4e6eb;
+  --color-line-strong: #d3d6dd;
+  --color-ink: #111116;
+  --color-ink-muted: #4a4f5c;
+  --color-ink-faint: #767b88;
+  --color-accent: #65a30d;
+  --color-accent-strong: #4d7c0f;
+  --color-accent-soft: rgb(101 163 13 / 0.14);
+  --color-violet: #6d5dfc;
+  --color-mint: #0d9488;
+  --color-amber: #d97706;
+  --color-positive: #16a34a;
+  --color-negative: #dc2626;
+  --color-warning: #ca8a04;
+  --app-overlay: #ffffff;
+  --app-overlay-shadow: 0 24px 60px -24px rgb(17 17 22 / 0.28);
+  --app-card-shadow: 0 1px 2px rgb(17 17 22 / 0.04), 0 8px 24px -16px rgb(17 17 22 / 0.18);
+}
+
+:root {
+  --app-overlay: #101016;
+  --app-overlay-shadow: 0 24px 60px -20px rgb(0 0 0 / 0.8);
+  --app-card-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03);
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 250ms ease, color 250ms ease;
+}
+
+/* Card surface (kept under the old utility names so every component picks it up). */
+@utility glass {
+  background-color: var(--color-surface);
+  box-shadow: var(--app-card-shadow);
+}
+
+/* Overlays (modals, menus, tooltips). */
+@utility glass-strong {
+  background-color: var(--app-overlay);
+  box-shadow: var(--app-overlay-shadow);
+}
+
+select option {
+  background-color: var(--color-surface);
+  color: var(--color-ink);
+}
+
+:root[data-theme='light'] input[type='date']::-webkit-calendar-picker-indicator {
+  filter: none;
+}
+
+/* Large, light display numbers (₱82,940.00). */
+.display-num {
+  font-weight: 300;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+/* Hide horizontal scrollbars on the pill tab bar while keeping it scrollable. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+input[type='date']::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- Motion ---- */
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+
+/* Whole page fades up when opened. */
+.page-enter { animation: page-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* Cards and sections on each page rise in one after another. */
+.page-enter section,
+.page-enter .stagger > * {
+  animation: rise-in 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.page-enter section:nth-of-type(1), .page-enter .stagger > :nth-child(1) { animation-delay: 40ms; }
+.page-enter section:nth-of-type(2), .page-enter .stagger > :nth-child(2) { animation-delay: 80ms; }
+.page-enter section:nth-of-type(3), .page-enter .stagger > :nth-child(3) { animation-delay: 120ms; }
+.page-enter section:nth-of-type(4), .page-enter .stagger > :nth-child(4) { animation-delay: 160ms; }
+.page-enter section:nth-of-type(5), .page-enter .stagger > :nth-child(5) { animation-delay: 200ms; }
+.page-enter section:nth-of-type(n + 6) { animation-delay: 240ms; }
+
+dialog[open].modal-enter { animation: modal-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+dialog[open].modal-enter::backdrop { animation: page-in 200ms ease-out both; }
+
+/* Bars grow from the left when they first appear. */
+@keyframes grow-x {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+.grow-x {
+  transform-origin: left center;
+  animation: grow-x 900ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Soft pulse for the notification dot. */
+@keyframes soft-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(200 245 66 / 0.55); }
+  50% { box-shadow: 0 0 0 5px rgb(200 245 66 / 0); }
+}
+.pulse-dot { animation: soft-pulse 2s ease-in-out infinite; }
+
+/* ---- Theme switch animation ---- */
+/* View Transitions: the new theme grows as a circle from the toggle (--vt-x / --vt-y). */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-new(root) {
+  animation: theme-reveal 650ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes theme-reveal {
+  from { clip-path: circle(0 at var(--vt-x, 50%) var(--vt-y, 50%)); }
+  to { clip-path: circle(150vmax at var(--vt-x, 50%) var(--vt-y, 50%)); }
+}
+
+/* Fallback (and OS-driven switches): colours cross-fade briefly. */
+.theme-fade,
+.theme-fade *,
+.theme-fade *::before,
+.theme-fade *::after {
+  transition:
+    background-color 400ms ease,
+    border-color 400ms ease,
+    color 400ms ease,
+    fill 400ms ease,
+    stroke 400ms ease !important;
+}

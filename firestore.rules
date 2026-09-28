@@ -1,0 +1,443 @@
+rules_version = '2';
+
+// Personal Finance Tracker — Firestore Security Rules
+//
+// Principles:
+//  * Every document lives under users/{userId} and only that verified user may touch it.
+//  * Every write is validated: allow-listed fields (no mass assignment), types, money limits.
+//  * ownerId / createdAt are immutable; timestamps must be server time.
+//  * Referenced accounts/categories/goals/debts must exist under the SAME user (no IDOR).
+//  * Ledger entries (contributions, debt payments, audit logs) are append-only, and the
+//    running totals they affect can only change in the same atomic batch.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    // ₱999,999,999,999.99 expressed in centavos (safe integer range).
+    function maxMoney() { return 99999999999999; }
+
+    function isOwner(userId) {
+      return request.auth != null
+        && request.auth.uid == userId
+        && request.auth.token.email_verified == true;
+    }
+
+    function incoming() { return request.resource.data; }
+
+    function isMoney(v) { return v is int && v >= 0 && v <= maxMoney(); }
+    function isPositiveMoney(v) { return v is int && v > 0 && v <= maxMoney(); }
+    function isSignedMoney(v) { return v is int && v >= -maxMoney() && v <= maxMoney(); }
+    function isText(v, minLen, maxLen) { return v is string && v.size() >= minLen && v.size() <= maxLen; }
+    function optText(d, field, maxLen) { return !(field in d) || isText(d[field], 0, maxLen); }
+    function optTimestamp(d, field) { return !(field in d) || d[field] == null || d[field] is timestamp; }
+    function isDay(v) { return v is int && v >= 1 && v <= 31; }
+    function isMonthId(v) { return v is string && v.matches('^[0-9]{4}-(0[1-9]|1[0-2])$'); }
+
+    // Business dates: not before 1970 and not more than ~1 year in the future.
+    function isBusinessDate(v) {
+      return v is timestamp
+        && v > timestamp.date(1970, 1, 1)
+        && v < request.time + duration.value(400, 'd');
+    }
+
+    function createMeta(userId) {
+      return incoming().ownerId == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+    }
+
+    function updateMeta() {
+      return incoming().ownerId == resource.data.ownerId
+        && incoming().createdAt == resource.data.createdAt
+        && incoming().updatedAt == request.time;
+    }
+
+    function userPath(userId, col, id) {
+      return /databases/$(database)/documents/users/$(userId)/$(col)/$(id);
+    }
+
+    // Referenced document must exist under the same user after this write/batch.
+    function ownsAfter(userId, col, id) {
+      return id is string && id.size() > 0 && existsAfter(userPath(userId, col, id));
+    }
+
+    // ------------------------------------------------------------------
+    // Validators
+    // ------------------------------------------------------------------
+
+    function validProfile(userId, d) {
+      return d.keys().hasOnly(['ownerId', 'email', 'displayName', 'currency', 'coachUrl', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'email', 'displayName', 'currency', 'createdAt', 'updatedAt'])
+        && d.ownerId == userId
+        && d.email == request.auth.token.email
+        && isText(d.displayName, 1, 60)
+        && d.currency == 'PHP'
+        // Only a Google Apps Script web-app URL may be stored (the app sends the ID token there).
+        && (!('coachUrl' in d) || (d.coachUrl is string && d.coachUrl.size() <= 200
+            && d.coachUrl.matches('^https://script[.]google[.]com/macros/s/[A-Za-z0-9_-]{20,}/exec$')));
+    }
+
+    function validAccount(d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'type', 'institution', 'currency', 'openingBalance',
+                               'status', 'lastFour', 'creditLimit', 'statementDay', 'dueDay',
+                               'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'type', 'currency', 'openingBalance', 'status',
+                            'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 60)
+        && d.type in ['cash', 'bank', 'ewallet', 'credit_card', 'investment', 'loan']
+        && optText(d, 'institution', 60)
+        && d.currency == 'PHP'
+        && isSignedMoney(d.openingBalance)
+        && d.status in ['active', 'archived']
+        // Only the last four digits of a card may ever be stored.
+        && (!('lastFour' in d) || (d.lastFour is string && d.lastFour.matches('^[0-9]{4}$')))
+        && (!('creditLimit' in d) || isMoney(d.creditLimit))
+        && (!('statementDay' in d) || isDay(d.statementDay))
+        && (!('dueDay' in d) || isDay(d.dueDay));
+    }
+
+    function validCategory(d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'type', 'color', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'type', 'color', 'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 40)
+        && d.type in ['income', 'expense']
+        && d.color is string && d.color.matches('^#[0-9a-fA-F]{6}$');
+    }
+
+    function validTransaction(userId, d) {
+      return d.keys().hasOnly(['ownerId', 'type', 'amount', 'currency', 'accountId', 'fromAccountId',
+                               'toAccountId', 'categoryId', 'description', 'date', 'notes', 'source',
+                               'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'type', 'amount', 'currency', 'description', 'date',
+                            'createdAt', 'updatedAt'])
+        && d.currency == 'PHP'
+        && isText(d.description, 1, 120)
+        && optText(d, 'notes', 500)
+        // 'gmail' marks transactions created by the user's own Gmail auto-import script.
+        && (!('source' in d) || d.source == 'gmail')
+        && isBusinessDate(d.date)
+        && (
+          // Income / expense: one owned account + an owned category of the matching type.
+          (d.type in ['income', 'expense']
+            && isPositiveMoney(d.amount)
+            && !('fromAccountId' in d) && !('toAccountId' in d)
+            && ownsAfter(userId, 'accounts', d.accountId)
+            && 'categoryId' in d
+            && getAfter(userPath(userId, 'categories', d.categoryId)).data.type == d.type)
+          ||
+          // Transfer: a single atomic document moving money between two owned accounts.
+          (d.type == 'transfer'
+            && isPositiveMoney(d.amount)
+            && !('accountId' in d) && !('categoryId' in d)
+            && d.fromAccountId != d.toAccountId
+            && ownsAfter(userId, 'accounts', d.fromAccountId)
+            && ownsAfter(userId, 'accounts', d.toAccountId))
+          ||
+          // Adjustment: signed correction on one owned account; never income/expense.
+          (d.type == 'adjustment'
+            && isSignedMoney(d.amount) && d.amount != 0
+            && !('fromAccountId' in d) && !('toAccountId' in d) && !('categoryId' in d)
+            && ownsAfter(userId, 'accounts', d.accountId))
+        );
+    }
+
+    function validBudget(userId, budgetId, d) {
+      return d.keys().hasOnly(['ownerId', 'categoryId', 'month', 'limit', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'categoryId', 'month', 'limit', 'createdAt', 'updatedAt'])
+        && isMonthId(d.month)
+        && isPositiveMoney(d.limit)
+        // Deterministic id => exactly one budget per category per month.
+        && budgetId == d.month + '_' + d.categoryId
+        && getAfter(userPath(userId, 'categories', d.categoryId)).data.type == 'expense';
+    }
+
+    function validSavingsGoal(d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'targetAmount', 'currentAmount', 'targetDate',
+                               'lastContributionId', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'targetAmount', 'currentAmount', 'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 60)
+        && isPositiveMoney(d.targetAmount)
+        && isMoney(d.currentAmount)
+        && optTimestamp(d, 'targetDate')
+        && (!('lastContributionId' in d) || d.lastContributionId is string);
+    }
+
+    // A goal's currentAmount may only change together with a brand-new contribution
+    // created in the same batch whose amount equals the delta.
+    function savingsChangeIsBacked(userId, goalId) {
+      return incoming().currentAmount == resource.data.currentAmount
+        || (
+          incoming().lastContributionId is string
+          && incoming().lastContributionId != resource.data.get('lastContributionId', '')
+          && !exists(userPath(userId, 'savingsContributions', incoming().lastContributionId))
+          && getAfter(userPath(userId, 'savingsContributions', incoming().lastContributionId)).data.goalId == goalId
+          && incoming().currentAmount == resource.data.currentAmount
+               + getAfter(userPath(userId, 'savingsContributions', incoming().lastContributionId)).data.amount
+        );
+    }
+
+    function validContribution(userId, contributionId, d) {
+      return d.keys().hasOnly(['ownerId', 'goalId', 'amount', 'date', 'note', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'goalId', 'amount', 'date', 'createdAt', 'updatedAt'])
+        && isSignedMoney(d.amount) && d.amount != 0
+        && isBusinessDate(d.date)
+        && optText(d, 'note', 200)
+        && getAfter(userPath(userId, 'savingsGoals', d.goalId)).data.lastContributionId == contributionId;
+    }
+
+    function validBill(userId, d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'kind', 'amount', 'dueDate', 'frequency', 'isPaid',
+                               'lastPaidAt', 'accountId', 'categoryId', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'kind', 'amount', 'dueDate', 'frequency', 'isPaid',
+                            'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 60)
+        && d.kind in ['rent', 'electricity', 'water', 'internet', 'phone', 'loan', 'credit_card',
+                      'subscription', 'other']
+        && isPositiveMoney(d.amount)
+        && isBusinessDate(d.dueDate)
+        && d.frequency in ['once', 'weekly', 'monthly', 'quarterly', 'yearly']
+        && d.isPaid is bool
+        && optTimestamp(d, 'lastPaidAt')
+        && (!('accountId' in d) || ownsAfter(userId, 'accounts', d.accountId))
+        && (!('categoryId' in d) || getAfter(userPath(userId, 'categories', d.categoryId)).data.type == 'expense');
+    }
+
+    function validDebt(d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'lender', 'principal', 'outstandingBalance',
+                               'interestRate', 'paymentAmount', 'paymentFrequency', 'nextPaymentDate',
+                               'lastPaymentId', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'principal', 'outstandingBalance', 'interestRate',
+                            'paymentAmount', 'paymentFrequency', 'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 60)
+        && optText(d, 'lender', 60)
+        && isPositiveMoney(d.principal)
+        && isMoney(d.outstandingBalance)
+        // Annual rate in basis points (e.g. 12.5% => 1250), 0..100%.
+        && d.interestRate is int && d.interestRate >= 0 && d.interestRate <= 10000
+        && isMoney(d.paymentAmount)
+        && d.paymentFrequency in ['weekly', 'monthly', 'quarterly', 'yearly']
+        && optTimestamp(d, 'nextPaymentDate')
+        && (!('lastPaymentId' in d) || d.lastPaymentId is string);
+    }
+
+    function debtChangeIsBacked(userId, debtId) {
+      return incoming().outstandingBalance == resource.data.outstandingBalance
+        || (
+          incoming().lastPaymentId is string
+          && incoming().lastPaymentId != resource.data.get('lastPaymentId', '')
+          && !exists(userPath(userId, 'debtPayments', incoming().lastPaymentId))
+          && getAfter(userPath(userId, 'debtPayments', incoming().lastPaymentId)).data.debtId == debtId
+          && incoming().outstandingBalance == resource.data.outstandingBalance
+               - getAfter(userPath(userId, 'debtPayments', incoming().lastPaymentId)).data.principalDelta
+        );
+    }
+
+    function validDebtPayment(userId, paymentId, d) {
+      return d.keys().hasOnly(['ownerId', 'debtId', 'kind', 'amount', 'principalDelta', 'date', 'note',
+                               'transactionId', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'debtId', 'kind', 'amount', 'principalDelta', 'date',
+                            'createdAt', 'updatedAt'])
+        && d.kind in ['payment', 'adjustment']
+        && isSignedMoney(d.amount) && d.amount != 0
+        && isSignedMoney(d.principalDelta)
+        // A payment reduces the balance by its amount; an adjustment is a signed correction.
+        && ((d.kind == 'payment' && d.amount > 0 && d.principalDelta == d.amount)
+            || (d.kind == 'adjustment' && d.principalDelta == d.amount))
+        && isBusinessDate(d.date)
+        && optText(d, 'note', 200)
+        && (!('transactionId' in d) || ownsAfter(userId, 'transactions', d.transactionId))
+        && getAfter(userPath(userId, 'debts', d.debtId)).data.lastPaymentId == paymentId;
+    }
+
+    function validInvestment(userId, d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'symbol', 'assetType', 'accountId', 'quantity',
+                               'purchasePrice', 'currentValue', 'valuedAt', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'assetType', 'quantity', 'purchasePrice', 'currentValue',
+                            'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 60)
+        && optText(d, 'symbol', 15)
+        && d.assetType in ['stock', 'fund', 'uitf', 'bond', 'crypto', 'time_deposit', 'other']
+        && (!('accountId' in d) || ownsAfter(userId, 'accounts', d.accountId))
+        && d.quantity is number && d.quantity >= 0 && d.quantity <= 1000000000000
+        && isMoney(d.purchasePrice)
+        && isMoney(d.currentValue)
+        && optTimestamp(d, 'valuedAt');
+    }
+
+    function validInvestmentTxn(userId, d) {
+      return d.keys().hasOnly(['ownerId', 'investmentId', 'kind', 'amount', 'date', 'note',
+                               'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'investmentId', 'kind', 'amount', 'date', 'createdAt', 'updatedAt'])
+        && d.kind in ['contribution', 'withdrawal']
+        && isPositiveMoney(d.amount)
+        && isBusinessDate(d.date)
+        && optText(d, 'note', 200)
+        && ownsAfter(userId, 'investments', d.investmentId);
+    }
+
+    function validFinancialGoal(d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'kind', 'targetAmount', 'currentAmount', 'targetDate',
+                               'notes', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'name', 'kind', 'targetAmount', 'createdAt', 'updatedAt'])
+        && isText(d.name, 1, 60)
+        && d.kind in ['net_worth', 'debt_free', 'savings_total', 'custom']
+        && isMoney(d.targetAmount)
+        && (!('currentAmount' in d) || isMoney(d.currentAmount))
+        && optTimestamp(d, 'targetDate')
+        && optText(d, 'notes', 500);
+    }
+
+    function validSnapshot(monthId, d) {
+      return d.keys().hasOnly(['ownerId', 'month', 'assets', 'liabilities', 'netWorth', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['ownerId', 'month', 'assets', 'liabilities', 'netWorth', 'createdAt', 'updatedAt'])
+        && isMonthId(monthId) && d.month == monthId
+        && isSignedMoney(d.assets) && isMoney(d.liabilities)
+        && d.netWorth == d.assets - d.liabilities;
+    }
+
+    function validAuditLog(userId, d) {
+      return d.keys().hasOnly(['ownerId', 'action', 'entityType', 'entityId', 'details', 'createdAt'])
+        && d.keys().hasAll(['ownerId', 'action', 'entityType', 'createdAt'])
+        && d.ownerId == userId
+        && d.createdAt == request.time
+        && d.action is string && d.action.matches('^[a-z_]+\\.[a-z_]+$') && d.action.size() <= 40
+        && isText(d.entityType, 1, 30)
+        && optText(d, 'entityId', 128)
+        && optText(d, 'details', 300);
+    }
+
+    // ------------------------------------------------------------------
+    // Paths — everything is scoped to users/{userId}
+    // ------------------------------------------------------------------
+
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId)
+        && validProfile(userId, incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isOwner(userId)
+        && validProfile(userId, incoming())
+        && incoming().createdAt == resource.data.createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+
+      match /accounts/{accountId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validAccount(incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validAccount(incoming()) && updateMeta();
+        allow delete: if isOwner(userId);
+      }
+
+      match /categories/{categoryId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validCategory(incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validCategory(incoming()) && updateMeta()
+          && incoming().type == resource.data.type;
+        allow delete: if isOwner(userId);
+      }
+
+      match /transactions/{transactionId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validTransaction(userId, incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validTransaction(userId, incoming()) && updateMeta();
+        allow delete: if isOwner(userId);
+      }
+
+      match /budgets/{budgetId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validBudget(userId, budgetId, incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validBudget(userId, budgetId, incoming()) && updateMeta();
+        allow delete: if isOwner(userId);
+      }
+
+      match /savingsGoals/{goalId} {
+        allow read: if isOwner(userId);
+        // Starts at zero, or with a starting contribution created in the same batch.
+        allow create: if isOwner(userId) && validSavingsGoal(incoming()) && createMeta(userId)
+          && ((incoming().currentAmount == 0 && !('lastContributionId' in incoming()))
+              || (incoming().lastContributionId is string
+                  && getAfter(userPath(userId, 'savingsContributions', incoming().lastContributionId)).data.goalId == goalId
+                  && getAfter(userPath(userId, 'savingsContributions', incoming().lastContributionId)).data.amount == incoming().currentAmount));
+        allow update: if isOwner(userId) && validSavingsGoal(incoming()) && updateMeta()
+          && savingsChangeIsBacked(userId, goalId);
+        allow delete: if isOwner(userId);
+      }
+
+      match /savingsContributions/{contributionId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validContribution(userId, contributionId, incoming())
+          && createMeta(userId);
+        allow update: if false; // append-only ledger
+        allow delete: if isOwner(userId);
+      }
+
+      match /bills/{billId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validBill(userId, incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validBill(userId, incoming()) && updateMeta();
+        allow delete: if isOwner(userId);
+      }
+
+      match /debts/{debtId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validDebt(incoming()) && createMeta(userId)
+          && !('lastPaymentId' in incoming());
+        allow update: if isOwner(userId) && validDebt(incoming()) && updateMeta()
+          && debtChangeIsBacked(userId, debtId);
+        allow delete: if isOwner(userId);
+      }
+
+      match /debtPayments/{paymentId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validDebtPayment(userId, paymentId, incoming())
+          && createMeta(userId);
+        allow update: if false; // append-only ledger
+        allow delete: if isOwner(userId);
+      }
+
+      match /investments/{investmentId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validInvestment(userId, incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validInvestment(userId, incoming()) && updateMeta();
+        allow delete: if isOwner(userId);
+      }
+
+      match /investmentTransactions/{txnId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validInvestmentTxn(userId, incoming()) && createMeta(userId);
+        allow update: if false; // append-only ledger
+        allow delete: if isOwner(userId);
+      }
+
+      match /financialGoals/{goalId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validFinancialGoal(incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validFinancialGoal(incoming()) && updateMeta();
+        allow delete: if isOwner(userId);
+      }
+
+      match /netWorthSnapshots/{monthId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validSnapshot(monthId, incoming()) && createMeta(userId);
+        allow update: if isOwner(userId) && validSnapshot(monthId, incoming()) && updateMeta();
+        allow delete: if false;
+      }
+
+      match /auditLogs/{logId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && validAuditLog(userId, incoming());
+        allow update, delete: if false; // tamper-evident: append-only
+      }
+    }
+
+    // Deny everything not matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
